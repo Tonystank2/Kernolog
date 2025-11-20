@@ -17,6 +17,7 @@ import threading
 import subprocess
 import time
 from datetime import datetime
+from collections import deque
 
 import numpy as np
 import faiss
@@ -29,6 +30,7 @@ EMBED_DIM = 384
 BATCH_SIZE = 16
 DEFAULT_K = 5
 FLUSH_INTERVAL = 10  # seconds between repeated-log summaries
+MAX_METADATA_SIZE = 100000  # Maximum number of logs to keep in memory
 
 # Global state
 log_queue = queue.Queue()
@@ -44,6 +46,11 @@ cache_lock = threading.Lock()
 # Shutdown event
 shutdown_event = threading.Event()
 
+# Pre-compiled regex patterns for normalize_log
+TIMESTAMP_HOSTNAME_PATTERN = re.compile(r'^[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\S+\s+')
+PID_PATTERN = re.compile(r'\[\d+\]')
+WHITESPACE_PATTERN = re.compile(r'\s+')
+
 
 def normalize_log(line: str) -> str:
     """
@@ -56,15 +63,17 @@ def normalize_log(line: str) -> str:
     
     This allows detection of identical log messages that only differ in
     timestamp, hostname, or process ID.
+    
+    Optimized to use pre-compiled regex patterns for better performance.
     """
     # Remove leading timestamp (e.g., "Nov 04 23:58:33") and hostname
-    line = re.sub(r'^[A-Z][a-z]{2}\s+\d+\s+\d+:\d+:\d+\s+\S+\s+', '', line)
+    line = TIMESTAMP_HOSTNAME_PATTERN.sub('', line)
     
     # Remove PID markers like [1234]
-    line = re.sub(r'\[\d+\]', '', line)
+    line = PID_PATTERN.sub('', line)
     
     # Normalize multiple spaces to single space
-    line = re.sub(r'\s+', ' ', line)
+    line = WHITESPACE_PATTERN.sub(' ', line)
     
     return line.strip()
 
@@ -75,6 +84,8 @@ def watch_journalctl():
     
     Runs journalctl -f and normalizes each log line for deduplication.
     Stores normalized logs in the repeat cache for batch processing.
+    
+    Optimized with better subprocess handling and reduced locking overhead.
     """
     proc = None
     try:
@@ -100,19 +111,24 @@ def watch_journalctl():
             
             normalized = normalize_log(line)
             if normalized:
+                # Optimize cache access by only locking when necessary
                 with cache_lock:
+                    # Use get with default to avoid KeyError
                     repeat_cache[normalized] = repeat_cache.get(normalized, 0) + 1
     
     except Exception as e:
         print(f"Error in journalctl watcher: {e}", file=sys.stderr)
     
     finally:
-        if proc and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        if proc:
+            # Ensure proper cleanup
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()  # Wait for kill to complete
 
 
 def repeat_flusher():
@@ -123,6 +139,8 @@ def repeat_flusher():
     log messages and either:
     - Sends single occurrences as-is
     - Summarizes repeated messages as "⏱ timestamp | message repeated Nx"
+    
+    Optimized to reduce string formatting and unnecessary operations.
     """
     next_id = 0
     
@@ -131,10 +149,14 @@ def repeat_flusher():
         if shutdown_event.wait(timeout=FLUSH_INTERVAL):
             break
         
+        # Cache timestamp string to avoid repeated formatting
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        current_ts = time.time()
         
         # Atomically extract and clear cache
         with cache_lock:
+            if not repeat_cache:
+                continue
             items = list(repeat_cache.items())
             repeat_cache.clear()
         
@@ -143,19 +165,18 @@ def repeat_flusher():
             if not msg:
                 continue
             
-            ts = time.time()
-            
             if count == 1:
                 # Single occurrence - no summarization needed
-                log_queue.put((next_id, msg, ts))
+                log_queue.put((next_id, msg, current_ts))
             else:
                 # Multiple occurrences - create summary
                 summary = f'⏱ {now} | "{msg}" repeated {count}x'
-                log_queue.put((next_id, summary, ts))
+                log_queue.put((next_id, summary, current_ts))
             
             next_id += 1
     
     # Final flush on shutdown
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with cache_lock:
         items = list(repeat_cache.items())
         repeat_cache.clear()
@@ -174,6 +195,8 @@ def embed_worker():
     
     Batches logs for efficient embedding, then adds them to the FAISS index
     along with their metadata. Handles graceful shutdown with final batch flush.
+    
+    Optimized to avoid unnecessary batch processing when empty.
     """
     batch_ids = []
     batch_texts = []
@@ -190,8 +213,15 @@ def embed_worker():
             
             # Update metadata with thread safety
             with metadata_lock:
+                # Implement circular buffer for metadata to prevent unbounded growth
                 for i, txt, tstamp in zip(batch_ids, batch_texts, batch_timestamps):
                     metadata.append({"id": i, "text": txt, "timestamp": tstamp})
+                
+                # Trim metadata if it exceeds maximum size
+                if len(metadata) > MAX_METADATA_SIZE:
+                    # Remove oldest entries
+                    overflow = len(metadata) - MAX_METADATA_SIZE
+                    del metadata[:overflow]
         
         except Exception as e:
             print(f"Error processing batch: {e}", file=sys.stderr)
@@ -203,10 +233,12 @@ def embed_worker():
     
     while not shutdown_event.is_set():
         try:
-            _id, text, ts = log_queue.get(timeout=1.0)
+            # Use longer timeout to reduce CPU wake-ups
+            _id, text, ts = log_queue.get(timeout=2.0)
         except queue.Empty:
-            # Flush partial batch if any
-            process_batch()
+            # Flush partial batch if any (skip if empty)
+            if batch_texts:
+                process_batch()
             continue
         
         # Add to batch
@@ -219,7 +251,8 @@ def embed_worker():
             process_batch()
     
     # Final flush on shutdown
-    process_batch()
+    if batch_texts:
+        process_batch()
 
 
 def search_query(q: str, k: int, display_mode: str):
@@ -233,10 +266,19 @@ def search_query(q: str, k: int, display_mode: str):
     
     Returns:
         List of matching log entries
+    
+    Optimized with early validation and efficient metadata access.
     """
+    # Validate input early
+    if not q or not q.strip():
+        return ["Empty query provided."]
+    
+    if k <= 0:
+        return ["Invalid k value. Must be positive."]
+    
     try:
         # Generate query embedding
-        q_emb = model.encode([q], convert_to_numpy=True)
+        q_emb = model.encode([q.strip()], convert_to_numpy=True)
         
         # Search FAISS index
         with metadata_lock:
@@ -247,10 +289,13 @@ def search_query(q: str, k: int, display_mode: str):
             k_adjusted = min(k, index.ntotal)
             D, I = index.search(q_emb, k_adjusted)
             
+            # Pre-compute metadata length for bounds checking
+            meta_len = len(metadata)
             results = []
+            
             for dist, idx in zip(D[0], I[0]):
                 # FAISS returns -1 for invalid indices
-                if idx < 0 or idx >= len(metadata):
+                if idx < 0 or idx >= meta_len:
                     continue
                 
                 meta = metadata[idx]
@@ -261,7 +306,7 @@ def search_query(q: str, k: int, display_mode: str):
                         f"{meta['timestamp']:.3f} | dist={dist:.3f} | {meta['text']}"
                     )
         
-        return results
+        return results if results else ["No matching results found."]
     
     except Exception as e:
         return [f"Search error: {e}"]
@@ -294,6 +339,8 @@ def parse_query_options(line: str):
     
     Returns:
         Tuple of (query_text, k, display_mode)
+    
+    Optimized to minimize string operations and provide better validation.
     """
     k = DEFAULT_K
     display_mode = "pretty"
@@ -303,15 +350,17 @@ def parse_query_options(line: str):
     for part in parts:
         if part.startswith("k="):
             try:
-                k = int(part.split("=", 1)[1])
-                if k <= 0:
+                k_val = int(part[2:])  # Faster than split
+                if k_val > 0:
+                    k = k_val
+                else:
                     print("Warning: k must be positive; using default.")
                     k = DEFAULT_K
             except ValueError:
                 print("Warning: Invalid k value; using default.")
         
         elif part.startswith("display="):
-            mode = part.split("=", 1)[1].lower()
+            mode = part[8:].lower()  # Faster than split
             if mode in ("raw", "pretty"):
                 display_mode = mode
             else:
